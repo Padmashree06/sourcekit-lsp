@@ -873,7 +873,7 @@ package final actor SemanticIndexManager {
       _,
       _ in
     }
-    await updateSymbolGraphTask.waitToFinishPropagatingCancellation()
+    await updateSymbolGraphTask?.waitToFinishPropagatingCancellation()
   }
 
   /// Index the given set of files at the given priority, preparing their targets beforehand, if needed. Files that are

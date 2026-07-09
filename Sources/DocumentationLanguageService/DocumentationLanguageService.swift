@@ -76,11 +76,81 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     _ notification: DidOpenTextDocumentNotification,
     snapshot: DocumentSnapshot
   ) async {
-    // The DocumentationLanguageService does not do anything with document events
+    schedulePublishSymbolLinkDiagnostics(for: snapshot.uri)
+  }
+
+  private func publishSymbolLinkDiagnostics(for uri: DocumentURI) async {
+    guard let sourceKitLSPServer else { return }
+    guard let snapshot = try? self.documentManager.latestSnapshot(uri) else { return }
+    guard !Task.isCancelled else { return }
+
+    let symbolLinks = collectSymbolLinks(in: snapshot)
+    guard let symbols = await loadSymbolGraph(for: uri) else {
+      // Module hasn't built yet don't give out diagnotics
+      return
+    }
+    guard !Task.isCancelled else { return }
+
+    let diagnostics: [Diagnostic] = symbolLinks.compactMap { link in
+      guard matchingSymbol(for: link.symbol, in: symbols) == nil else { return nil }
+      return Diagnostic(
+        range: link.range,
+        severity: .error,
+        source: "SourceKit-LSP",
+        message: "No symbol link resolved for '\(link.symbol)'"
+      )
+    }
+
+    sourceKitLSPServer.sendNotificationToClient(
+      PublishDiagnosticsNotification(uri: uri, diagnostics: diagnostics)
+    )
+  }
+  /// Loads and parses the symbol graph of current Document's module
+  private func loadSymbolGraph(for currentDocumentURI: DocumentURI) async -> [[String: Any]]? {
+    guard let targetID = await self.workspace.buildServerManager.targets(for: currentDocumentURI).first,
+      let moduleName = await self.workspace.buildServerManager.moduleName(for: targetID)
+    else {
+      return nil
+    }
+
+    let workspaceRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+    let targetGraphURL =
+      workspaceRoot
+      .appendingPathComponent(".build/symbol-graphs")
+      .appendingPathComponent("\(moduleName).symbols.json")
+
+    guard let data = try? Data(contentsOf: targetGraphURL),
+      let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+      let symbolsArray = jsonObject["symbols"] as? [[String: Any]]
+    else {
+      return nil
+    }
+    return symbolsArray
+  }
+
+  /// Finds the symbol graph entry matching `symbolPath` (e.g. "Sloth/energy"), if any.
+  private func matchingSymbol(for symbolPath: String, in symbols: [[String: Any]]) -> [String: Any]? {
+    let pathComponents = symbolPath.components(separatedBy: "/")
+    let symbolName = pathComponents.last ?? symbolPath
+
+    for symbol in symbols {
+      guard let namesDict = symbol["names"] as? [String: Any],
+        let title = namesDict["title"] as? String,
+        title == symbolName
+      else { continue }
+
+      if pathComponents.count > 1 {
+        guard let symbolPathComponents = symbol["pathComponents"] as? [String] else { continue }
+        guard Array(symbolPathComponents.suffix(pathComponents.count)) == pathComponents else { continue }
+      }
+      return symbol
+    }
+    return nil
   }
 
   package func closeDocument(_ notification: DidCloseTextDocumentNotification) async {
-    // The DocumentationLanguageService does not do anything with document events
+    cancelInFlightPublishDiagnosticsTask(for: notification.textDocument.uri)
+    inFlightPublishDiagnosticsTasks[notification.textDocument.uri] = nil
   }
 
   package func reopenDocument(_ notification: ReopenTextDocumentNotification) async {
@@ -105,7 +175,7 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     postEditSnapshot: DocumentSnapshot,
     edits: [SwiftSyntax.SourceEdit]
   ) async {
-    // The DocumentationLanguageService does not do anything with document events
+    schedulePublishSymbolLinkDiagnostics(for: postEditSnapshot.uri)
   }
 
   package func symbolInfo(_ req: SymbolInfoRequest) async throws -> [SymbolDetails] {
@@ -137,55 +207,47 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     return .locations([targetLocation])
   }
 
-  /// Walks the Markdown/DocC AST looking for the inline code span or symbol link
-  /// that contains a given source position.
-  private struct SymbolLocator: MarkupWalker {
-    let target: Markdown.SourceLocation
-    var found: String?
+  /// A symbol link found while walking a Markdown/DocC AST, e.g. ``Sloth/energy``.
+  private struct SymbolLinkReference {
+    let symbol: String
+    let range: Markdown.SourceRange
+  }
 
-    init(target: Markdown.SourceLocation) {
-      self.target = target
-    }
-
-    private func contains(_ range: Markdown.SourceRange?) -> Bool {
-      guard let range else { return false }
-      return range.lowerBound <= target && target < range.upperBound
-    }
-
-    mutating func visitInlineCode(_ inlineCode: InlineCode) {
-      if found == nil, let range = inlineCode.range, contains(range) {
-        found = inlineCode.code
-      }
-    }
+  /// Walks the Markdown/DocC AST collecting every symbol link in the document.
+  /// Used both for go-to-definition (find the one under the cursor) and diagnostics (validate all of them).
+  private struct SymbolLinkCollector: MarkupWalker {
+    var found: [SymbolLinkReference] = []
 
     mutating func visitSymbolLink(_ symbolLink: SymbolLink) {
-      if found == nil, contains(symbolLink.range), let destination = symbolLink.destination {
-        found = destination
+      if let range = symbolLink.range, let destination = symbolLink.destination {
+        found.append(SymbolLinkReference(symbol: destination, range: range))
       }
     }
 
     mutating func defaultVisit(_ markup: any Markup) {
-      guard found == nil else { return }
       descendInto(markup)
     }
   }
 
+  /// Parses `text` once, walks it once, and returns the symbol link whose range contains `target`, if any.
+  private func symbolLink(
+    at target: Markdown.SourceLocation,
+    in text: String,
+    options: ParseOptions = [.parseSymbolLinks]
+  ) -> String? {
+    let document = Markdown.Document(parsing: text, options: options)
+    var collector = SymbolLinkCollector()
+    collector.visit(document)
+    return collector.found.first { $0.range.lowerBound <= target && target < $0.range.upperBound }?.symbol
+  }
+
   private func extractSymbolFromText(_ text: String, at position: Position) -> String? {
-    // LSP positions are 0-based; swift-markdown SourceLocation is 1-based.
     let target = Markdown.SourceLocation(
       line: position.line + 1,
       column: position.utf16index + 1,
       source: nil
     )
-
-    let document = Markdown.Document(parsing: text, options: [.parseSymbolLinks, .parseBlockDirectives])
-    var locator = SymbolLocator(target: target)
-    locator.visit(document)
-
-    guard let symbol = locator.found, !symbol.isEmpty else {
-      return nil
-    }
-    return symbol
+    return symbolLink(at: target, in: text, options: [.parseSymbolLinks, .parseBlockDirectives])
   }
 
   private func extractSymbolFromDocComment(snapshot: DocumentSnapshot, at position: Position) -> String? {
@@ -207,31 +269,14 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
 
       switch piece {
       case .docLineComment(let commentText):
-        let pieceStartLine = converter.location(
-          for: AbsolutePosition(utf8Offset: triviaOffset)
-        ).line
+        let pieceStartLine = converter.location(for: AbsolutePosition(utf8Offset: triviaOffset)).line
+        guard pieceStartLine == cursorLine else { continue }
 
-        // Only process the piece that's on the same line as the cursor
-        guard pieceStartLine == cursorLine else {
-          continue
-        }
-
-        let triviaStartColumn = converter.location(
-          for: AbsolutePosition(utf8Offset: triviaOffset)
-        ).column
-
+        let triviaStartColumn = converter.location(for: AbsolutePosition(utf8Offset: triviaOffset)).column
         let relativeColumn = cursorColumn - triviaStartColumn + 1
 
-        let target = Markdown.SourceLocation(
-          line: 1,
-          column: relativeColumn,
-          source: nil
-        )
-        let document = Markdown.Document(parsing: commentText, options: [.parseSymbolLinks])
-        var locator = SymbolLocator(target: target)
-        locator.visit(document)
-
-        if let found = locator.found {
+        let target = Markdown.SourceLocation(line: 1, column: relativeColumn, source: nil)
+        if let found = symbolLink(at: target, in: commentText) {
           return found
         }
 
@@ -246,68 +291,89 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     return nil
   }
 
-  private func findLocationInSymbolGraphs(
-    for symbolPath: String,
-    currentDocumentURI: DocumentURI
-  ) async -> Location? {
-    // Split the full path into components e.g. "Sloth/energy" -> ["Sloth", "energy"]
-    let pathComponents = symbolPath.components(separatedBy: "/")
-    let symbolName = pathComponents.last ?? symbolPath
-
-    guard let targetID = await self.workspace.buildServerManager.targets(for: currentDocumentURI).first,
-      let moduleName = await self.workspace.buildServerManager.moduleName(for: targetID)
+  private func findLocationInSymbolGraphs(for symbolPath: String, currentDocumentURI: DocumentURI) async -> Location? {
+    guard let symbols = await loadSymbolGraph(for: currentDocumentURI),
+      let symbol = matchingSymbol(for: symbolPath, in: symbols),
+      let locationDict = symbol["location"] as? [String: Any],
+      let uriString = locationDict["uri"] as? String,
+      let positionDict = locationDict["position"] as? [String: Any],
+      let line = positionDict["line"] as? Int,
+      let character = positionDict["character"] as? Int,
+      let targetURI = try? DocumentURI(string: uriString)
     else {
       return nil
     }
+    let position = Position(line: line, utf16index: character)
+    return Location(uri: targetURI, range: position..<position)
+  }
 
-    let workspaceRoot = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    let targetGraphURL =
-      workspaceRoot
-      .appendingPathComponent(".build/symbol-graphs")
-      .appendingPathComponent("\(moduleName).symbols.json")
+  private var inFlightPublishDiagnosticsTasks: [DocumentURI: Task<Void, Never>] = [:]
 
-    guard let data = try? Data(contentsOf: targetGraphURL),
-      let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-      let symbolsArray = jsonObject["symbols"] as? [[String: Any]]
-    else {
-      return nil
+  private func cancelInFlightPublishDiagnosticsTask(for uri: DocumentURI) {
+    inFlightPublishDiagnosticsTasks[uri]?.cancel()
+  }
+
+  private func schedulePublishSymbolLinkDiagnostics(for uri: DocumentURI) {
+    cancelInFlightPublishDiagnosticsTask(for: uri)
+    inFlightPublishDiagnosticsTasks[uri] = Task(priority: .medium) { [weak self] in
+      do {
+        try await Task.sleep(for: .milliseconds(500))
+      } catch {
+        return  // cancelled by a newer edit
+      }
+      await self?.publishSymbolLinkDiagnostics(for: uri)
     }
+  }
 
-    for symbol in symbolsArray {
-      guard let namesDict = symbol["names"] as? [String: Any],
-        let title = namesDict["title"] as? String,
-        title == symbolName
-      else {
-        continue
-      }
+  private func collectSymbolLinks(in snapshot: DocumentSnapshot) -> [(symbol: String, range: Range<Position>)] {
+    snapshot.language == .swift
+      ? collectSymbolLinksInSwiftDocComments(snapshot)
+      : collectSymbolLinksInMarkdown(snapshot.text)
+  }
 
-      // Validate the full path using pathComponents from the symbol graph
-      if pathComponents.count > 1 {
-        guard let symbolPathComponents = symbol["pathComponents"] as? [String] else {
-          continue
+  private func collectSymbolLinksInMarkdown(_ text: String) -> [(symbol: String, range: Range<Position>)] {
+    let document = Markdown.Document(parsing: text, options: [.parseSymbolLinks, .parseBlockDirectives])
+    var collector = SymbolLinkCollector()
+    collector.visit(document)
+
+    return collector.found.map { link in
+      let start = Position(line: link.range.lowerBound.line - 1, utf16index: link.range.lowerBound.column - 1)
+      let end = Position(line: link.range.upperBound.line - 1, utf16index: link.range.upperBound.column - 1)
+      return (link.symbol, start..<end)
+    }
+  }
+
+  private func collectSymbolLinksInSwiftDocComments(
+    _ snapshot: DocumentSnapshot
+  ) -> [(symbol: String, range: Range<Position>)] {
+    let sourceFile = SwiftParser.Parser.parse(source: snapshot.text)
+    let converter = SourceLocationConverter(fileName: "", tree: sourceFile)
+    var results: [(symbol: String, range: Range<Position>)] = []
+
+    for token in sourceFile.tokens(viewMode: .sourceAccurate) {
+      var triviaOffset = token.position.utf8Offset
+      for piece in token.leadingTrivia.pieces {
+        defer { triviaOffset += piece.sourceLength.utf8Length }
+        guard case .docLineComment(let commentText) = piece else { continue }
+
+        let triviaStart = converter.location(for: AbsolutePosition(utf8Offset: triviaOffset))
+        let document = Markdown.Document(parsing: commentText, options: [.parseSymbolLinks])
+        var collector = SymbolLinkCollector()
+        collector.visit(document)
+
+        for link in collector.found {
+          let startColumn = triviaStart.column + link.range.lowerBound.column - 1
+          let endColumn = triviaStart.column + link.range.upperBound.column - 1
+          let line = triviaStart.line - 1
+          results.append(
+            (
+              link.symbol,
+              Position(line: line, utf16index: startColumn - 1)..<Position(line: line, utf16index: endColumn - 1)
+            )
+          )
         }
-        // The reference path must match the tail of the symbol's pathComponents
-        let tail = symbolPathComponents.suffix(pathComponents.count)
-        guard Array(tail) == pathComponents else {
-          continue
-        }
-      }
-
-      guard let locationDict = symbol["location"] as? [String: Any],
-        let uriString = locationDict["uri"] as? String,
-        let positionDict = locationDict["position"] as? [String: Any],
-        let line = positionDict["line"] as? Int,
-        let character = positionDict["character"] as? Int
-      else {
-        return nil
-      }
-
-      if let targetURI = try? DocumentURI(string: uriString) {
-        let destinationPosition = Position(line: line, utf16index: character)
-        let destinationRange = Range(uncheckedBounds: (lower: destinationPosition, upper: destinationPosition))
-        return Location(uri: targetURI, range: destinationRange)
       }
     }
-    return nil
+    return results
   }
 }

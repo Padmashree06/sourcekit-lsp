@@ -2195,7 +2195,13 @@ extension SourceKitLSPServer {
     workspace: Workspace,
     languageService: any LanguageService
   ) async throws -> LocationsOrLocationLinksResponse? {
-    let indexBasedResponse = try await indexBasedDefinition(req, workspace: workspace, languageService: languageService)
+    var indexBasedResponse: [Location] = []
+    do {
+      indexBasedResponse = try await indexBasedDefinition(req, workspace: workspace, languageService: languageService)
+    } catch {
+      logger.info("indexBasedDefinition failed: \(error.forLogging)")
+      indexBasedResponse = []
+    }
     let copiedFileMap = await workspace.buildServerManager.cachedCopiedFileMap
     // If we're unable to handle the definition request using our index, see if the
     // language service can handle it (e.g. clangd can provide AST based definitions).

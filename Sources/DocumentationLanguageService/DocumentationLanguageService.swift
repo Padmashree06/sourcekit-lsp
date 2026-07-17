@@ -152,9 +152,27 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     }
 
     mutating func visitSymbolLink(_ symbolLink: SymbolLink) {
-      if found == nil, contains(symbolLink.range), let destination = symbolLink.destination {
-        found = destination
+      guard
+        found == nil,
+        contains(symbolLink.range),
+        let destination = symbolLink.destination,
+        let range = symbolLink.range
+      else {
+        return
       }
+      let relativeColumn = target.column - range.lowerBound.column - 3
+      let components = destination.split(separator: "/")
+      var currentLength = 0
+
+      for (index, component) in components.enumerated() {
+        let end = currentLength + component.utf8.count
+        if relativeColumn < end {
+          found = components[0...index].joined(separator: "/")
+          return
+        }
+        currentLength = end + 1  // Skip '/'
+      }
+      found = destination
     }
 
     mutating func defaultVisit(_ markup: any Markup) {

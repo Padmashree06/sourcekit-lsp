@@ -809,7 +809,7 @@ extension SwiftLanguageService {
           }
         }
         if isInDocComment {
-          throw ResponseError.requestNotImplemented(DefinitionRequest.self)
+          return nil
         }
       }
     }

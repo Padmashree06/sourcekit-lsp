@@ -392,7 +392,7 @@ package actor SourceKitLSPServer {
       @Sendable @escaping (
         RequestType, Workspace, any LanguageService
       ) async throws ->
-      RequestType.Response
+      RequestType.Response?
   ) async {
     await request.reply {
       let request = request.params
@@ -407,7 +407,10 @@ package actor SourceKitLSPServer {
       // Return the results from the first language service that doesn't throw a `requestNotImplemented` error.
       for languageService in languageServices {
         do {
-          return try await requestHandler(request, workspace, languageService)
+          guard let response = try await requestHandler(request, workspace, languageService) else {
+            continue
+          }
+          return response
         } catch let error as ResponseError where error.code == .requestNotImplemented {
           continue
         }

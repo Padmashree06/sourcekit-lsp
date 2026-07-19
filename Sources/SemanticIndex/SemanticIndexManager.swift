@@ -198,6 +198,8 @@ package final actor SemanticIndexManager {
 
   private let indexStoreUpToDateTracker = UpToDateTracker<DocumentURI, BuildTargetIdentifier>()
 
+  private let symbolGraphUpToDateTracker = UpToDateTracker<BuildTargetIdentifier, DummySecondaryKey>()
+
   /// The preparation tasks that have been started and are either scheduled in the task scheduler or currently
   /// executing.
   ///
@@ -368,6 +370,7 @@ package final actor SemanticIndexManager {
   package func scheduleReindex() async {
     await indexStoreUpToDateTracker.markAllKnownOutOfDate()
     await preparationUpToDateTracker.markAllKnownOutOfDate()
+    await symbolGraphUpToDateTracker.markAllKnownOutOfDate()
     await scheduleBuildGraphGenerationAndBackgroundIndexAllFiles(indexFilesWithUpToDateUnit: true)
   }
 
@@ -438,6 +441,7 @@ package final actor SemanticIndexManager {
         outOfDateTargets.formUnion(changedTargets)
       }
     }
+    await symbolGraphUpToDateTracker.markOutOfDate(targetsOfChangedFiles)
     outOfDateTargets.formUnion(await buildServerManager.targets(dependingOn: targetsOfChangedFiles))
     if !outOfDateTargets.isEmpty {
       logger.info(
@@ -476,9 +480,11 @@ package final actor SemanticIndexManager {
           """
         )
         await preparationUpToDateTracker.markOutOfDate(targetsAndDependencies)
+        await symbolGraphUpToDateTracker.markOutOfDate(targets)
       }
     } else {
       await preparationUpToDateTracker.markAllKnownOutOfDate()
+      await symbolGraphUpToDateTracker.markAllKnownOutOfDate()
     }
 
     // We need to invalidate the preparation status of the changed files immediately so that we re-prepare its target
@@ -812,6 +818,7 @@ package final actor SemanticIndexManager {
         target: target,
         language: language,
         buildServerManager: self.buildServerManager,
+        symbolGraphUpToDateTracker: symbolGraphUpToDateTracker,
         logMessageToIndexLog: logMessageToIndexLog,
         timeout: updateIndexStoreTimeout
       )

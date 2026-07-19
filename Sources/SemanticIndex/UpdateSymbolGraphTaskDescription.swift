@@ -45,6 +45,8 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
   /// The build server manager that is used to get the toolchain and build settings.
   private let buildServerManager: BuildServerManager
 
+  private let symbolGraphUpToDateTracker: UpToDateTracker<BuildTargetIdentifier, DummySecondaryKey>
+
   private let logMessageToIndexLog:
     @Sendable (
       _ message: String, _ type: WindowMessageType, _ structure: LanguageServerProtocol.StructuredLogKind
@@ -80,6 +82,7 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
     target: BuildTargetIdentifier,
     language: Language,
     buildServerManager: BuildServerManager,
+    symbolGraphUpToDateTracker: UpToDateTracker<BuildTargetIdentifier, DummySecondaryKey>,
     logMessageToIndexLog:
       @escaping @Sendable (
         _ message: String, _ type: WindowMessageType, _ structure: LanguageServerProtocol.StructuredLogKind
@@ -90,6 +93,7 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
     self.target = target
     self.language = language
     self.buildServerManager = buildServerManager
+    self.symbolGraphUpToDateTracker = symbolGraphUpToDateTracker
     self.logMessageToIndexLog = logMessageToIndexLog
     self.timeout = timeout
   }
@@ -98,6 +102,12 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
     await withLoggingSubsystemAndScope(subsystem: indexLoggingSubsystem, scope: "update-symbolgraph-\(id % 100)") {
       guard language == .swift else { return }
 
+      if await symbolGraphUpToDateTracker.isUpToDate(target) {
+        logger.debug("Not regenerating symbol graph for \(target.forLogging) because it is already up to date")
+        return
+      }
+
+      let startDate = Date()
       let buildSettings: FileBuildSettings
       let swiftc: URL
 
@@ -108,7 +118,7 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
             for: firstFile,
             in: target,
             language: language,
-            fallbackAfterTimeout: true
+            fallbackAfterTimeout: false
           )
         else { return }
         buildSettings = resolvedSettings
@@ -164,10 +174,7 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
         {
           if i + 1 < rawArgs.count {
             baseArgs.append(arg)
-            var next = rawArgs[i + 1]
-            if next.contains("vscode-local:") {
-              next = next.replacingOccurrences(of: "vscode-local:", with: "file:")
-            }
+            let next = rawArgs[i + 1]
             baseArgs.append(next)
             i += 2
           } else {
@@ -195,14 +202,7 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
         baseArgs.append("-wmo")
       }
 
-      // --- Clean environment ---
-      var cleanEnvironment = ProcessInfo.processInfo.environment
-      cleanEnvironment.removeValue(forKey: "SWIFT_DRIVER_SUPPLEMENTARY_OUTPUT_FILE_MAP")
-      cleanEnvironment.removeValue(forKey: "SWIFT_DRIVER_OUTPUT_FILE_MAP")
-      cleanEnvironment.removeValue(forKey: "SWIFT_DRIVER_TEMP_DIR")
-      cleanEnvironment.removeValue(forKey: "SWIFT_DRIVER_RESPONSE_FILE_PATH")
-      cleanEnvironment.removeValue(forKey: "SWIFT_DRIVER_TOOLNAME")
-
+      let environment = ProcessInfo.processInfo.environment
       let taskId = "symbol-graph-\(id)"
 
       logMessageToIndexLog(
@@ -219,11 +219,14 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
           "-Xfrontend", "-emit-symbol-graph",
           "-Xfrontend", "-emit-symbol-graph-dir", "-Xfrontend", symbolGraphDir.pathString,
           "-Xfrontend", "-experimental-skip-all-function-bodies",
+          "-Xfrontend", "-experimental-lazy-typecheck",
+          "-Xfrontend", "-experimental-skip-non-exportable-decls",
+          "-Xfrontend", "-experimental-allow-module-with-compiler-errors",
         ]
       do {
         let process = Process(
           arguments: args,
-          environment: cleanEnvironment,
+          environment: environment,
           workingDirectory: baseDir,
           outputRedirection: .none
         )
@@ -232,8 +235,14 @@ package struct UpdateSymbolGraphTaskDescription: IndexTaskDescription {
 
         let result = try await process.waitUntilExit()
         let exitStatus = result.exitStatus.exhaustivelySwitchable
+        let elapsed = Date().timeIntervalSince(startDate) * 1000
+
+        logger.log(
+          "Finished updating symbol graph in \(elapsed, privacy: .public)ms"
+        )
 
         if exitStatus.isSuccess {
+          await symbolGraphUpToDateTracker.markUpToDate([target], updateOperationStartDate: startDate)
           logMessageToIndexLog(
             """
             Symbol graph generation completed successfully.

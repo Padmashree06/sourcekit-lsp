@@ -622,6 +622,7 @@ extension SwiftLanguageService {
     await syntaxTreeManager.clearSyntaxTrees(for: notification.textDocument.uri)
     await syntaxTreeManager.clearExperimentalFeatures(for: notification.textDocument.uri)
     await inlayHintManager.removeCachedInlayHints(for: notification.textDocument.uri)
+    await sourceKitLSPServer?.clearDiagnostics(for: notification.textDocument.uri, from: .swift)
     switch try? ReferenceDocumentURL(from: notification.textDocument.uri) {
     case .macroExpansion:
       break
@@ -715,12 +716,7 @@ extension SwiftLanguageService {
           throw CancellationError()
         }
 
-        sourceKitLSPServer.sendNotificationToClient(
-          PublishDiagnosticsNotification(
-            uri: document,
-            diagnostics: diagnosticReport.items
-          )
-        )
+        await sourceKitLSPServer.publishDiagnostics(diagnosticReport.items, for: document, from: .swift)
       } catch is CancellationError {
       } catch {
         logger.fault(

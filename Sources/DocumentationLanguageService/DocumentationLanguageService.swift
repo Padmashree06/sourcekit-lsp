@@ -39,6 +39,11 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
 
   let workspace: Workspace
 
+  /// In-flight debounce tasks for `publishSymbolLinkDiagnostics`, keyed by document.
+  /// Cancel-and-replace on every edit so we don't run diagnostics on every keystroke, and so an
+  /// older, now-stale run can never race a newer one and publish outdated results.
+  private var inFlightPublishDiagnosticsTasks: [DocumentURI: Task<Void, Never>] = [:]
+
   package static var experimentalCapabilities: [String: LSPAny] {
     return [
       DoccDocumentationRequest.method: ["version": 1],
@@ -76,11 +81,13 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     _ notification: DidOpenTextDocumentNotification,
     snapshot: DocumentSnapshot
   ) async {
-    // The DocumentationLanguageService does not do anything with document events
+    schedulePublishSymbolLinkDiagnostics(for: snapshot.uri)
   }
 
   package func closeDocument(_ notification: DidCloseTextDocumentNotification) async {
-    // The DocumentationLanguageService does not do anything with document events
+    cancelInFlightPublishDiagnosticsTask(for: notification.textDocument.uri)
+    inFlightPublishDiagnosticsTasks[notification.textDocument.uri] = nil
+    await sourceKitLSPServer?.clearDiagnostics(for: notification.textDocument.uri, from: .documentation)
   }
 
   package func reopenDocument(_ notification: ReopenTextDocumentNotification) async {
@@ -105,7 +112,7 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     postEditSnapshot: DocumentSnapshot,
     edits: [SwiftSyntax.SourceEdit]
   ) async {
-    // The DocumentationLanguageService does not do anything with document events
+    schedulePublishSymbolLinkDiagnostics(for: postEditSnapshot.uri)
   }
 
   package func definition(_ req: DefinitionRequest) async throws -> LocationsOrLocationLinksResponse? {
@@ -136,8 +143,7 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     return .locations([targetLocation])
   }
 
-  /// Walks the Markdown/DocC AST looking for symbol link
-  /// that contains a given source position.
+  /// Walks the Markdown/DocC AST looking for a symbol link that contains a given source position.
   private struct SymbolLocator: MarkupWalker {
     let target: Markdown.SourceLocation
     var found: String?
@@ -151,6 +157,10 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
       return range.lowerBound <= target && target < range.upperBound
     }
 
+    /// Resolves a click inside a multi-component link like ``Sloth/energy`` to just the component under the cursor and
+    ///  everything before it: clicking `Sloth` goes to `Sloth`;
+    /// clicking `energy` goes to `Sloth/energy`. Without this, any click inside the link — including on
+    /// the first component — would always navigate to the full, most-nested destination.
     mutating func visitSymbolLink(_ symbolLink: SymbolLink) {
       guard
         found == nil,
@@ -160,6 +170,7 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
       else {
         return
       }
+
       let relativeColumn = target.column - range.lowerBound.column - 3
       let components = destination.split(separator: "/")
       var currentLength = 0
@@ -223,6 +234,20 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     return line.utf8.distance(from: line.startIndex, to: stringIndex)
   }
 
+  /// The inverse of `utf8Offset(inLine:forUTF16Offset:)`. Diagnostics need this because we go the
+  /// other direction from go-to-definition: swift-markdown hands us a UTF-8 column for a symbol
+  /// link it found, and we need to turn that into the UTF-16 column LSP `Position` expects.
+  private func utf16Offset(inLine line: String, forUTF8Offset utf8Offset: Int) -> Int {
+    let utf8View = line.utf8
+    guard
+      let utf8Index = utf8View.index(utf8View.startIndex, offsetBy: utf8Offset, limitedBy: utf8View.endIndex),
+      let stringIndex = utf8Index.samePosition(in: line)
+    else {
+      return line.utf16.count
+    }
+    return line.utf16.distance(from: line.startIndex, to: stringIndex)
+  }
+
   private func docCommentGroups(
     in trivia: Trivia,
     tokenStart: AbsolutePosition,
@@ -266,8 +291,6 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
   }
 
   /// Strips `///` and any leading whitespace from each line comment piece.
-  /// Returns each line alongside how many UTF-16 units were stripped off its front,
-  /// so cursor columns can be remapped correctly.
   private func stripLineCommentDelimiters(
     _ lines: [(text: String, startLine: Int, startColumn: Int)]
   ) -> [(text: String, strippedPrefixCount: Int)] {
@@ -287,8 +310,6 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     }
   }
   /// Strips `/**`, `*/`, and per-line leading `*`/whitespace from a block comment.
-  /// Returns each line alongside how many UTF-16 units were stripped off its front,
-  /// so that cursor columns can be remapped correctly.
   private func stripBlockCommentDelimiters(_ text: String) -> [(text: String, strippedPrefixCount: Int)] {
     let lines = text.components(separatedBy: "\n")
     return lines.enumerated().map { index, rawLine in
@@ -406,10 +427,20 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
     for symbolPath: String,
     currentDocumentURI: DocumentURI
   ) async -> Location? {
-    // Split the full path into components e.g. "Sloth/energy" -> ["Sloth", "energy"]
-    let pathComponents = symbolPath.components(separatedBy: "/")
-    let symbolName = pathComponents.last ?? symbolPath
+    guard let symbolGraph = await loadSymbolGraph(for: currentDocumentURI),
+      let symbol = matchingSymbol(for: symbolPath, in: symbolGraph),
+      let location = symbol.location,
+      let targetURI = try? DocumentURI(string: location.uri)
+    else {
+      return nil
+    }
 
+    let destinationPosition = Position(line: location.position.line, utf16index: location.position.character)
+    return Location(uri: targetURI, range: destinationPosition..<destinationPosition)
+  }
+
+  /// Loads and decodes the symbol graph for `currentDocumentURI`'s module.
+  private func loadSymbolGraph(for currentDocumentURI: DocumentURI) async -> SymbolGraph? {
     guard let targetID = await self.workspace.buildServerManager.targets(for: currentDocumentURI).first,
       let moduleName = await self.workspace.buildServerManager.moduleName(for: targetID)
     else {
@@ -422,39 +453,215 @@ package actor DocumentationLanguageService: LanguageService, Sendable {
       .appendingPathComponent(".build/symbol-graphs")
       .appendingPathComponent("\(moduleName).symbols.json")
 
-    guard let data = try? Data(contentsOf: targetGraphURL),
-      let symbolGraph = try? JSONDecoder().decode(SymbolGraph.self, from: data)
-    else {
+    guard let data = try? Data(contentsOf: targetGraphURL) else {
       return nil
     }
+    return try? JSONDecoder().decode(SymbolGraph.self, from: data)
+  }
 
-    for symbol in symbolGraph.symbols {
-      guard symbol.names.title == symbolName else {
-        continue
+  /// Finds the symbol graph entry matching `symbolPath` (e.g. "Sloth/energy"), if any.
+  private func matchingSymbol(for symbolPath: String, in symbolGraph: SymbolGraph) -> SymbolGraph.Symbol? {
+    let pathComponents = symbolPath.components(separatedBy: "/")
+    let symbolName = pathComponents.last ?? symbolPath
+
+    return symbolGraph.symbols.first { symbol in
+      guard symbol.names.title == symbolName else { return false }
+      guard pathComponents.count > 1 else { return true }
+      guard let symbolPathComponents = symbol.pathComponents else { return false }
+      // The reference path must match the tail of the symbol's pathComponents, so any-depth
+      return Array(symbolPathComponents.suffix(pathComponents.count)) == pathComponents
+    }
+  }
+
+  // MARK: - Symbol link diagnostics
+
+  private struct SymbolLinkReference {
+    let symbol: String
+    let range: Markdown.SourceRange
+  }
+
+  /// Walks a Markdown/DocC AST collecting every symbol link and its range.
+  private struct SymbolLinkCollector: MarkupWalker {
+    var found: [SymbolLinkReference] = []
+
+    mutating func visitSymbolLink(_ symbolLink: SymbolLink) {
+      if let range = symbolLink.range, let destination = symbolLink.destination {
+        found.append(SymbolLinkReference(symbol: destination, range: range))
+      }
+    }
+  }
+
+  /// Maps a Markdown source location to an LSP position in the original source file.
+  private struct MappedLine {
+    let text: String
+    let absoluteLine: Int
+    let absoluteColumnBase: Int
+    let strippedPrefixCount: Int
+  }
+
+  private func mappedLines(for group: DocTriviaGroup) -> [MappedLine] {
+    switch group {
+    case .lines(let lines):
+      let strippedLines = stripLineCommentDelimiters(lines)
+      return zip(lines, strippedLines).map { raw, stripped in
+        MappedLine(
+          text: stripped.text,
+          absoluteLine: raw.startLine,
+          absoluteColumnBase: raw.startColumn,
+          strippedPrefixCount: stripped.strippedPrefixCount
+        )
       }
 
-      // Validate the full path using pathComponents from the symbol graph
-      if pathComponents.count > 1 {
-        guard let symbolPathComponents = symbol.pathComponents else {
-          continue
-        }
-        // The reference path must match the tail of the symbol's pathComponents
-        let tail = symbolPathComponents.suffix(pathComponents.count)
-        guard Array(tail) == pathComponents else {
-          continue
-        }
+    case .block(let text, let startLine, let startColumn):
+      let strippedLines = stripBlockCommentDelimiters(text)
+      return strippedLines.enumerated().map { index, stripped in
+        MappedLine(
+          text: stripped.text,
+          absoluteLine: startLine + index,
+          absoluteColumnBase: index == 0 ? startColumn : 0,
+          strippedPrefixCount: stripped.strippedPrefixCount
+        )
       }
+    }
+  }
 
-      guard let location = symbol.location,
-        let targetURI = try? DocumentURI(string: location.uri)
+  private func position(for location: Markdown.SourceLocation, in lines: [MappedLine]) -> Position? {
+    let index = location.line - 1
+    guard lines.indices.contains(index) else { return nil }
+    let line = lines[index]
+    let utf16OffsetInStripped = utf16Offset(inLine: line.text, forUTF8Offset: location.column - 1)
+    let absoluteUTF16 = line.absoluteColumnBase + line.strippedPrefixCount + utf16OffsetInStripped
+    return Position(line: line.absoluteLine, utf16index: absoluteUTF16)
+  }
+
+  /// Collects every symbol link inside one doc-comment trivia group
+  private func symbolLinks(in group: DocTriviaGroup) -> [(symbol: String, range: Range<Position>)] {
+    let lines = mappedLines(for: group)
+    let combinedText = lines.map(\.text).joined(separator: "\n")
+
+    let document = Markdown.Document(parsing: combinedText, options: [.parseSymbolLinks])
+    var collector = SymbolLinkCollector()
+    collector.visit(document)
+
+    return collector.found.compactMap { link in
+      guard
+        let start = position(for: link.range.lowerBound, in: lines),
+        let end = position(for: link.range.upperBound, in: lines)
       else {
         return nil
       }
-
-      let destinationPosition = Position(line: location.position.line, utf16index: location.position.character)
-      let destinationRange = Range(uncheckedBounds: (lower: destinationPosition, upper: destinationPosition))
-      return Location(uri: targetURI, range: destinationRange)
+      return (link.symbol, start..<end)
     }
-    return nil
+  }
+
+  private func collectSymbolLinksInSwiftDocComments(
+    _ snapshot: DocumentSnapshot
+  ) -> [(symbol: String, range: Range<Position>)] {
+    let sourceFile = SwiftParser.Parser.parse(source: snapshot.text)
+    var results: [(symbol: String, range: Range<Position>)] = []
+
+    for token in sourceFile.tokens(viewMode: .sourceAccurate) {
+      let groups = docCommentGroups(in: token.leadingTrivia, tokenStart: token.position, snapshot: snapshot)
+      for group in groups {
+        results.append(contentsOf: symbolLinks(in: group))
+      }
+    }
+    return results
+  }
+
+  private func collectSymbolLinksInMarkdown(_ text: String) -> [(symbol: String, range: Range<Position>)] {
+    let lines = text.components(separatedBy: "\n")
+    let document = Markdown.Document(parsing: text, options: [.parseSymbolLinks, .parseBlockDirectives])
+    var collector = SymbolLinkCollector()
+    collector.visit(document)
+
+    func position(for location: Markdown.SourceLocation) -> Position? {
+      let lineIndex = location.line - 1
+      guard lines.indices.contains(lineIndex) else { return nil }
+      let utf16Col = utf16Offset(inLine: lines[lineIndex], forUTF8Offset: location.column - 1)
+      return Position(line: lineIndex, utf16index: utf16Col)
+    }
+
+    return collector.found.compactMap { link in
+      guard let start = position(for: link.range.lowerBound), let end = position(for: link.range.upperBound) else {
+        return nil
+      }
+      return (link.symbol, start..<end)
+    }
+  }
+
+  private func collectSymbolLinks(in snapshot: DocumentSnapshot) -> [(symbol: String, range: Range<Position>)] {
+    switch snapshot.language {
+    case .swift:
+      return collectSymbolLinksInSwiftDocComments(snapshot)
+    case .markdown, .tutorial:
+      return collectSymbolLinksInMarkdown(snapshot.text)
+    default:
+      return []
+    }
+  }
+
+  private func cancelInFlightPublishDiagnosticsTask(for uri: DocumentURI) {
+    inFlightPublishDiagnosticsTasks[uri]?.cancel()
+  }
+
+  private func schedulePublishSymbolLinkDiagnostics(for uri: DocumentURI) {
+    cancelInFlightPublishDiagnosticsTask(for: uri)
+    inFlightPublishDiagnosticsTasks[uri] = Task(priority: .medium) { [weak self] in
+      do {
+        try await Task.sleep(for: .milliseconds(500))
+      } catch {
+        return  // cancelled by a newer edit
+      }
+      await self?.publishSymbolLinkDiagnostics(for: uri)
+    }
+  }
+
+  private func symbolLinkDiagnostics(for snapshot: DocumentSnapshot) async -> [Diagnostic]? {
+    let symbolLinks = collectSymbolLinks(in: snapshot)
+    guard let symbolGraph = await loadSymbolGraph(for: snapshot.uri) else {
+      return nil
+    }
+    return symbolLinks.compactMap { link in
+      guard matchingSymbol(for: link.symbol, in: symbolGraph) == nil else { return nil }
+      return Diagnostic(
+        range: link.range,
+        severity: .error,
+        source: "DocC",
+        message: "No symbol link resolved for '\(link.symbol)'"
+      )
+    }
+  }
+
+  private func publishSymbolLinkDiagnostics(for uri: DocumentURI) async {
+    guard let sourceKitLSPServer else { return }
+    guard let snapshot = try? self.documentManager.latestSnapshot(uri) else { return }
+
+    // Pull diagnostics are the first preference; only push if the client can't pull diagnostics for this document's language
+    let clientSupportsPull =
+      await sourceKitLSPServer.capabilityRegistry?.clientSupportsPullDiagnostics(for: snapshot.language) ?? false
+    guard !clientSupportsPull else { return }
+
+    guard !Task.isCancelled else { return }
+    guard let diagnostics = await symbolLinkDiagnostics(for: snapshot) else { return }
+    guard !Task.isCancelled else { return }
+
+    await sourceKitLSPServer.publishDiagnostics(diagnostics, for: uri, from: .documentation)
+  }
+
+  package func documentDiagnostic(_ req: DocumentDiagnosticsRequest) async throws -> DocumentDiagnosticReport {
+    switch try? ReferenceDocumentURL(from: req.textDocument.uri) {
+    case .generatedInterface:
+      // Generated interfaces don't have diagnostics associated with them.
+      return .full(RelatedFullDocumentDiagnosticReport(items: []))
+    case .macroExpansion, nil: break
+    }
+
+    guard let snapshot = try? self.documentManager.latestSnapshot(req.textDocument.uri) else {
+      return .full(RelatedFullDocumentDiagnosticReport(items: []))
+    }
+
+    let diagnostics = await symbolLinkDiagnostics(for: snapshot) ?? []
+    return .full(RelatedFullDocumentDiagnosticReport(items: diagnostics))
   }
 }
